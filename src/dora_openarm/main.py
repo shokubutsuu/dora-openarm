@@ -17,10 +17,12 @@
 import argparse
 import dataclasses
 import enum
+import fcntl
 import dora
 import openarm_driver
 import os
 import pathlib
+import signal
 import time
 import pyarrow as pa
 import numpy as np
@@ -275,10 +277,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Start the arm on startup.",
     )
+    parser.add_argument(
+        "--wait-lock",
+        default=os.getenv("WAIT_LOCK") or None,
+        help=(
+            "Before moving to the stop position on exit, hold the arm until no "
+            "process holds an exclusive flock on this file, e.g. a lifter that "
+            "is still coming down (default: don't wait)."
+        ),
+        type=pathlib.Path,
+    )
     args = parser.parse_args(argv)
     if args.align_delta_limit <= 0.0:
         parser.error("--align-delta-limit must be positive")
     return args
+
+
+# How long the arm holds on exit for the --wait-lock holder, and how long
+# once SIGTERM has come: dora sends it 10 s after Ctrl-C and SIGKILL 5 s
+# later, which leaves time for the stop trajectory only if it starts soon.
+WAIT_LOCK_LIMIT_S = 90.0
+WAIT_LOCK_AFTER_SIGTERM_S = 1.0
+_sigterm_at = None
+
+
+def _on_sigterm(signum, frame):
+    """Remember SIGTERM instead of dying, so the arm still goes to its stop position."""
+    global _sigterm_at
+    if _sigterm_at is None:
+        _sigterm_at = time.monotonic()
+
+
+def _wait_for_lock(path: pathlib.Path) -> bool:
+    """Hold until no process holds an exclusive flock on `path`, within limits."""
+    deadline = time.monotonic() + WAIT_LOCK_LIMIT_S
+    with open(path, "a") as lock:
+        print(f"Holding the arm until {path} is released", flush=True)
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                pass
+            if _sigterm_at is not None:
+                deadline = min(deadline, _sigterm_at + WAIT_LOCK_AFTER_SIGTERM_S)
+            if time.monotonic() >= deadline:
+                print(f"{path} is still locked; stopping the arm anyway", flush=True)
+                return False
+            time.sleep(0.1)
 
 
 def run(node, args: argparse.Namespace, create_driver):
@@ -441,6 +487,8 @@ def run(node, args: argparse.Namespace, create_driver):
                     command_metadata,
                 )
     if arm is not None:
+        if args.wait_lock is not None:
+            _wait_for_lock(args.wait_lock)
         if args.stop:
             arm.stop()
         else:
@@ -450,6 +498,8 @@ def run(node, args: argparse.Namespace, create_driver):
 def main():
     """Run the node."""
     args = parse_args()
+    if args.wait_lock is not None:
+        signal.signal(signal.SIGTERM, _on_sigterm)
     node = dora.Node()
     config = openarm_driver.Config(args.config)
     run(
