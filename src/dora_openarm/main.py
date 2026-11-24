@@ -17,10 +17,12 @@
 import argparse
 import dataclasses
 import enum
+import fcntl
 import dora
 import openarm_driver
 import os
 import pathlib
+import signal
 import time
 import pyarrow as pa
 import numpy as np
@@ -61,14 +63,18 @@ def _align(arm, state, new_position, name, threshold, trigger=None):
     def is_aligned(position1, position2):
         return np.all(np.abs(position1[:-1] - position2[:-1]) < threshold)
 
-    # If OpenArm is already aligned, we do nothing.
+    # If OpenArm is already aligned, alignment completes once the driver
+    # accepts the final target.
     if is_aligned(new_position, current_position):
-        return True
+        return arm.send_position(new_position)
     diff = new_position - state.align_target
     step_move = np.clip(diff, -state.step_limit, state.step_limit)
-    state.align_target += step_move
+    next_target = state.align_target + step_move
 
-    arm.send_position(state.align_target)
+    # Advance only when the driver accepts the target, so that a rejected
+    # step is retried instead of skipped.
+    if arm.send_position(next_target):
+        state.align_target = next_target
 
     # Check the physical position on the next command after the arm has moved.
     return False
@@ -180,10 +186,17 @@ def build_state_output(state, health: tuple[list[str], dict]) -> pa.Array:
     )
 
 
-def extract_values(value: pa.Array, key: str) -> np.ndarray:
-    """Read `key` from a length-1 StructArray, or a flat array as-is."""
+def extract_position(value: pa.Array) -> np.ndarray:
+    """Read a position from a struct, or a flat array as-is.
+
+    The struct is a length-1 struct containing `qpos` (`[{"qpos": [...]}]`),
+    or a legacy struct with one `new_position` row per joint.
+    """
     if pa.types.is_struct(value.type):
-        value = value.field(key)[0].values
+        if "qpos" in value.type.names:
+            value = value.field("qpos")[0].values
+        else:
+            value = value.field("new_position")
     return np.array(value, dtype=np.float32)
 
 
@@ -197,8 +210,8 @@ def command_epoch_matches(metadata: dict, start_epoch: int) -> bool:
     )
 
 
-def main():
-    """Move to the given position and output the current position."""
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse the node's command line arguments."""
     parser = argparse.ArgumentParser(description="Control OpenArm")
     parser.add_argument(
         "--side",
@@ -264,12 +277,63 @@ def main():
         default=False,
         help="Start the arm on startup.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--wait-lock",
+        default=os.getenv("WAIT_LOCK") or None,
+        help=(
+            "Before moving to the stop position on exit, hold the arm until no "
+            "process holds an exclusive flock on this file, e.g. a lifter that "
+            "is still coming down (default: don't wait)."
+        ),
+        type=pathlib.Path,
+    )
+    args = parser.parse_args(argv)
     if args.align_delta_limit <= 0.0:
         parser.error("--align-delta-limit must be positive")
-    node = dora.Node()
+    return args
+
+
+# How long the arm holds on exit for the --wait-lock holder, and how long
+# once SIGTERM has come: dora sends it 10 s after Ctrl-C and SIGKILL 5 s
+# later, which leaves time for the stop trajectory only if it starts soon.
+WAIT_LOCK_LIMIT_S = 90.0
+WAIT_LOCK_AFTER_SIGTERM_S = 1.0
+_sigterm_at = None
+
+
+def _on_sigterm(signum, frame):
+    """Remember SIGTERM instead of dying, so the arm still goes to its stop position."""
+    global _sigterm_at
+    if _sigterm_at is None:
+        _sigterm_at = time.monotonic()
+
+
+def _wait_for_lock(path: pathlib.Path) -> bool:
+    """Hold until no process holds an exclusive flock on `path`, within limits."""
+    deadline = time.monotonic() + WAIT_LOCK_LIMIT_S
+    with open(path, "a") as lock:
+        print(f"Holding the arm until {path} is released", flush=True)
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                pass
+            if _sigterm_at is not None:
+                deadline = min(deadline, _sigterm_at + WAIT_LOCK_AFTER_SIGTERM_S)
+            if time.monotonic() >= deadline:
+                print(f"{path} is still locked; stopping the arm anyway", flush=True)
+                return False
+            time.sleep(0.1)
+
+
+def run(node, args: argparse.Namespace, create_driver):
+    """Move to the given position and output the current position.
+
+    `create_driver(name)` creates a new, not yet started, OpenArm driver
+    for the arm `name`.
+    """
     name = f"{args.side}_arm"
-    config = openarm_driver.Config(args.config)
     align_threshold = args.align_threshold
     arm = None
     start_epoch = 0
@@ -280,21 +344,57 @@ def main():
         result["start_epoch"] = start_epoch
         return result
 
-    if args.start_on_startup:
-        arm = openarm_driver.SingleArmDriver(
-            name, config, can_interface=args.can_interface
+    # The dispatch timestamp and metadata of the last move_position whose
+    # target the driver sent.
+    sent_command = None
+
+    def send_commanded_position(metadata: dict):
+        # The driver resets this on start, so it is None until the
+        # first position command of this session is dispatched.
+        dispatch_timestamp = arm.last_command_dispatch_timestamp_ns
+        if dispatch_timestamp is None:
+            return
+        # Add the metadata only if the last sent target came from a
+        # move_position, not from e.g. the driver's startup motion.
+        command_metadata = {}
+        if sent_command is not None and sent_command[0] == dispatch_timestamp:
+            command_metadata = sent_command[1]
+        node.send_output(
+            "commanded_position",
+            build_qpos_output(np.asarray(arm.last_command, dtype=np.float32)),
+            {
+                **metadata,
+                **command_metadata,
+                # Keys this node sets take precedence over the command's.
+                "start_epoch": metadata["start_epoch"],
+                "observation_timestamp": metadata["observation_timestamp"],
+                "dispatch_timestamp": dispatch_timestamp,
+            },
         )
-        arm.start()
+
+    align_state = None
+    status = ArmStatus.STOPPED
+
+    def start_arm():
+        nonlocal arm, start_epoch, align_state, status
+        if arm is not None:
+            arm.stop()  # Stop the existing session before replacing it
+        align_state = None
+        status = ArmStatus.STOPPED
+        # Re-initialize the arm to ensure a fresh start
+        arm = create_driver(name)
+        # Keep the failed arm so that a later stop disables its motors.
+        if not arm.start():
+            return
         start_epoch += 1
         align_state = (
             AlignState(step_limit=args.align_delta_limit) if args.align else None
         )
         status = ArmStatus.STARTED
-        node.send_output("status", pa.array([status]), output_metadata())
-    else:
-        align_state = None
-        status = ArmStatus.STOPPED
-        node.send_output("status", pa.array([ArmStatus.STOPPED]), output_metadata())
+
+    if args.start_on_startup:
+        start_arm()
+    node.send_output("status", pa.array([status]), output_metadata())
     for event in node:
         if event["type"] != "INPUT":
             continue
@@ -303,20 +403,7 @@ def main():
         if event_id == "command":
             command = event["value"][0].as_py()
             if command == "start":
-                if arm is not None:
-                    arm.stop()  # Stop the existing session before replacing it
-                # Re-initialize the arm to ensure a fresh start
-                arm = openarm_driver.SingleArmDriver(
-                    name, config, can_interface=args.can_interface
-                )
-                arm.start()
-                start_epoch += 1
-                align_state = (
-                    AlignState(step_limit=args.align_delta_limit)
-                    if args.align
-                    else None
-                )
-                status = ArmStatus.STARTED
+                start_arm()
                 node.send_output(
                     "status", pa.array([status]), output_metadata(event["metadata"])
                 )
@@ -346,6 +433,7 @@ def main():
                 build_qpos_output(np.asarray(current_position, dtype=np.float32)),
                 metadata,
             )
+            send_commanded_position(metadata)
         elif event_id == "request_state":
             if status is ArmStatus.STOPPED:
                 continue
@@ -356,6 +444,7 @@ def main():
             metadata.pop("timestamp", None)
             metadata["observation_timestamp"] = snapshot_timestamp
             node.send_output("state", build_state_output(state, health), metadata)
+            send_commanded_position(metadata)
         elif event_id == "move_position":
             if status is ArmStatus.STOPPED:
                 continue
@@ -367,21 +456,9 @@ def main():
                     flush=True,
                 )
                 continue
-            value = event["value"]
-            if isinstance(value, pa.StructArray):
-                names = value.type.names
-                if "qpos" in names:
-                    new_position = extract_values(value, "qpos")
-                else:
-                    new_position = np.array(
-                        value.field("new_position"), dtype=np.float32
-                    )
-                # TODO: We use this for safety check later.
-                # other_arm_position = value.field("other_arm_position")
-            else:
-                new_position = np.array(value, dtype=np.float32)
-                # other_arm_position = None
+            new_position = extract_position(event["value"])
 
+            dispatch_timestamp = arm.last_command_dispatch_timestamp_ns
             if status is ready_status:
                 arm.send_position(new_position)
             elif status is ArmStatus.STARTED:
@@ -394,18 +471,44 @@ def main():
                     trigger=args.align_trigger,
                 )
                 if is_aligned:
-                    arm.send_position(new_position)
                     status = ArmStatus.ALIGNED
                     node.send_output(
                         "status",
                         pa.array([ArmStatus.ALIGNED]),
                         output_metadata(event["metadata"]),
                     )
+            # The dispatch timestamp changes only when the driver sends a
+            # target, including an intermediate alignment step.
+            if arm.last_command_dispatch_timestamp_ns != dispatch_timestamp:
+                command_metadata = dict(event["metadata"])
+                command_metadata.pop("timestamp", None)
+                sent_command = (
+                    arm.last_command_dispatch_timestamp_ns,
+                    command_metadata,
+                )
     if arm is not None:
+        if args.wait_lock is not None:
+            _wait_for_lock(args.wait_lock)
         if args.stop:
             arm.stop()
         else:
             arm.move_to_start_position()
+
+
+def main():
+    """Run the node."""
+    args = parse_args()
+    if args.wait_lock is not None:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    node = dora.Node()
+    config = openarm_driver.Config(args.config)
+    run(
+        node,
+        args,
+        lambda name: openarm_driver.SingleArmDriver(
+            name, config, can_interface=args.can_interface
+        ),
+    )
 
 
 if __name__ == "__main__":
